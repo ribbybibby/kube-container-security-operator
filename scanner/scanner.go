@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/ribbybibby/kube-container-security-operator/adapter"
 	secscanv1alpha1 "github.com/ribbybibby/kube-container-security-operator/apis/secscan/v1alpha1"
 	"github.com/ribbybibby/kube-container-security-operator/generated/versioned"
+	"github.com/ribbybibby/kube-container-security-operator/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,20 +25,26 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
+var (
+	errPodNotRunningOrReady = fmt.Errorf("Pod not running or ready")
+)
+
 // Scanner performs vulnerability scans on pods in a Kubernetes cluster and
 // saves the results as a VulnerabilityReport resource
 type Scanner struct {
-	kubeClient   kubernetes.Interface
-	podInformer  cache.SharedIndexInformer
-	vulnInformer cache.SharedIndexInformer
-	vulnClient   versioned.Interface
-	queue        workqueue.RateLimitingInterface
-	ns           string
-	scanAdapter  adapter.Interface
+	kubeClient      kubernetes.Interface
+	podInformer     cache.SharedIndexInformer
+	vulnInformer    cache.SharedIndexInformer
+	vulnClient      versioned.Interface
+	queue           workqueue.RateLimitingInterface
+	ns              string
+	scanAdapter     adapter.Interface
+	rescanThreshold time.Duration
+	resyncPeriod    time.Duration
 }
 
 // New returns a new Scanner
-func New(ns string, scanAdapter adapter.Interface) (*Scanner, error) {
+func New(ns string, scanAdapter adapter.Interface, rescanThreshold, resyncPeriod time.Duration) (*Scanner, error) {
 	// Kubernetes config
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
@@ -61,10 +67,12 @@ func New(ns string, scanAdapter adapter.Interface) (*Scanner, error) {
 
 	// Scanner
 	scanner := &Scanner{
-		kubeClient:  clientset,
-		vulnClient:  vulnClientSet,
-		ns:          ns,
-		scanAdapter: scanAdapter,
+		kubeClient:      clientset,
+		vulnClient:      vulnClientSet,
+		ns:              ns,
+		scanAdapter:     scanAdapter,
+		rescanThreshold: rescanThreshold,
+		resyncPeriod:    resyncPeriod,
 	}
 	scanner.queue = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "scanner")
 
@@ -80,7 +88,7 @@ func New(ns string, scanAdapter adapter.Interface) (*Scanner, error) {
 	scanner.podInformer = cache.NewSharedIndexInformer(
 		podListWatcher,
 		&corev1.Pod{},
-		60*time.Minute,
+		resyncPeriod,
 		cache.Indexers{},
 	)
 	scanner.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -101,9 +109,14 @@ func New(ns string, scanAdapter adapter.Interface) (*Scanner, error) {
 	scanner.vulnInformer = cache.NewSharedIndexInformer(
 		vulnListWatcher,
 		&secscanv1alpha1.VulnerabilityReport{},
-		60*time.Minute,
+		resyncPeriod,
 		cache.Indexers{},
 	)
+	scanner.vulnInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    scanner.handleAddVulnerabilityReport,
+		DeleteFunc: scanner.handleDeleteVulnerabilityReport,
+		UpdateFunc: scanner.handleUpdateVulnerabilityReport,
+	})
 
 	return scanner, nil
 }
@@ -133,6 +146,8 @@ func (s *Scanner) worker() {
 }
 
 func (s *Scanner) processNextItem() bool {
+	prometheus.PromQueueSize.Set(float64(s.queue.Len()))
+
 	key, quit := s.queue.Get()
 	if quit {
 		return false
@@ -145,13 +160,29 @@ func (s *Scanner) processNextItem() bool {
 		return true
 	}
 
-	log.Println(err)
+	// Don't print running/not ready errors. They're an expected part of
+	// pods starting and stopping
+	if err != errPodNotRunningOrReady {
+		log.Println(err)
+		log.Println("Requeued item", key)
+
+	}
 
 	s.queue.AddRateLimited(key)
 
-	log.Println("Requeued item", key)
-
 	return true
+}
+
+func (s *Scanner) handleAddVulnerabilityReport(obj interface{}) {
+	s.updateMetrics()
+}
+
+func (s *Scanner) handleDeleteVulnerabilityReport(obj interface{}) {
+	s.updateMetrics()
+}
+
+func (s *Scanner) handleUpdateVulnerabilityReport(oldObj, newObj interface{}) {
+	s.updateMetrics()
 }
 
 func (s *Scanner) handleAddPod(obj interface{}) {
@@ -163,6 +194,7 @@ func (s *Scanner) handleAddPod(obj interface{}) {
 		return
 	}
 
+	prometheus.PromPodEventsTotal.WithLabelValues("add", pod.Namespace).Inc()
 	s.queue.Add(key)
 }
 
@@ -175,6 +207,7 @@ func (s *Scanner) handleDeletePod(obj interface{}) {
 		return
 	}
 
+	prometheus.PromPodEventsTotal.WithLabelValues("delete", pod.Namespace).Inc()
 	s.queue.Add(key)
 }
 
@@ -187,6 +220,7 @@ func (s *Scanner) handleUpdatePod(oldObj, newObj interface{}) {
 		return
 	}
 
+	prometheus.PromPodEventsTotal.WithLabelValues("update", pod.Namespace).Inc()
 	s.queue.Add(key)
 }
 
@@ -215,6 +249,8 @@ func (s *Scanner) waitForCacheSync(stopc <-chan struct{}) error {
 }
 
 func (s *Scanner) Reconcile(key string) error {
+	defer prometheus.ObserveReconciliationDuration()()
+
 	keyParts := strings.Split(key, "/")
 
 	ns := keyParts[0]
@@ -222,6 +258,14 @@ func (s *Scanner) Reconcile(key string) error {
 
 	vulnReportClient := s.vulnClient.SecscanV1alpha1().VulnerabilityReports(ns)
 	podClient := s.kubeClient.CoreV1().Pods(ns)
+
+	defer func() {
+		// Garbage collect reports with no pods and remove dangling
+		// pods from existing manifests
+		if err := garbageCollectVulnerabilityReports(podClient, vulnReportClient); err != nil {
+			log.Printf("Failed to garbage collect reports in %s", ns)
+		}
+	}()
 
 	// Check if the pod exists
 	obj, exists, err := s.podInformer.GetIndexer().GetByKey(key)
@@ -235,19 +279,13 @@ func (s *Scanner) Reconcile(key string) error {
 			return fmt.Errorf("Failed to list VulnerabilityReport: %w", err)
 		}
 		for _, vulnReport := range vulnReportList.Items {
-			if vulnReport.Status.RemovePod(podName) {
+			if vulnReport.RemovePod(podName) {
 				_, err := vulnReportClient.Update(context.Background(), &vulnReport, metav1.UpdateOptions{})
 				if err != nil {
 					return fmt.Errorf("Failed to update VulnerabilityReport: %w", err)
 				}
 				log.Printf("Updated VulnerabilityReport: %s/%s", vulnReport.Namespace, vulnReport.Name)
 			}
-		}
-
-		// Garbage collect reports with no pods and remove dangling
-		// pods from existing manifests
-		if err := garbageCollectVulnerabilityReports(podClient, vulnReportClient); err != nil {
-			return fmt.Errorf("Failed to garbage collect unreferenced VulnerabilityReports: %w", err)
 		}
 
 		return nil
@@ -267,81 +305,40 @@ func (s *Scanner) Reconcile(key string) error {
 		}
 	}
 	if !running || !ready {
-		return fmt.Errorf("Pod not running or ready")
+		return errPodNotRunningOrReady
 	}
 
-	// Garbage collect reports with no pods and remove dangling
-	// pods from existing manifests
-	if err := garbageCollectVulnerabilityReports(podClient, vulnReportClient); err != nil {
-		return fmt.Errorf("Failed to garbage collect unreferenced VulnerabilityReports: %w", err)
-	}
-
-	// Find images to scan
+	// Scan pod containers
 	for _, containerStatus := range pod.Status.ContainerStatuses {
 		img := containerStatus.Image
 
 		var vulnReport *secscanv1alpha1.VulnerabilityReport
 
-		// Generate a sha1 of the image and the resolved imageID we're
-		// scanning for use as the unique identifier for this report
+		// Parse the image into a registry and artifact
+		registry, artifact, err := parseImage(containerStatus)
+		if err != nil {
+			return fmt.Errorf("Failed to parse reference: %w", err)
+		}
+
+		// The unique name of a vulnReport is a SHA1 of the registry +
+		// repository + tag + digest
 		h := sha1.New()
-		h.Write([]byte(containerStatus.Image + containerStatus.ImageID))
+		h.Write([]byte(registry.URL + artifact.Repository + artifact.Digest + artifact.Tag))
 		vulnReportName := hex.EncodeToString(h.Sum(nil))
 
+		// Find an existing report, if there is one
 		vulnReportKey := fmt.Sprintf("%s/%s", pod.Namespace, vulnReportName)
-
 		obj, exists, err := s.vulnInformer.GetIndexer().GetByKey(vulnReportKey)
 		if err != nil {
 			continue
 		}
 
+		// Controls whether the image is scanned or not
+		scan := false
+
 		// If a vulnerability report doesn't already exist for this
 		// image then create it
 		if !exists {
-			// TODO: Don't scan the digest if we've already scanned it but
-			// it didn't produce any vulnerabilities
-			scanImage := strings.Split(containerStatus.ImageID, "://")[1]
-
-			// Scan the image and return vulnerabilities
-			log.Printf("Scanning: %s", scanImage)
-			vulnerabilities, err := s.scanAdapter.Scan(scanImage)
-			if err != nil {
-				log.Printf("Error scanning image %s: %s", scanImage, err)
-				return err
-			}
-			log.Printf("Scan finished for: %s", scanImage)
-
-			// If there aren't any vulnerabilities then we don't
-			// need to create the VulnerabilityReport
-			if len(vulnerabilities) == 0 {
-				continue
-			}
-
-			// Parse the image into an Artifact reference
-			ref, err := name.ParseReference(img)
-			if err != nil {
-				return fmt.Errorf("Failed to parse reference: %w", err)
-			}
-			registry := secscanv1alpha1.Registry{
-				URL: ref.Context().RegistryStr(),
-			}
-			artifact := secscanv1alpha1.Artifact{
-				Repository: ref.Context().RepositoryStr(),
-			}
-			switch t := ref.(type) {
-			case name.Tag:
-				artifact.Tag = t.TagStr()
-				imageDigestParts := strings.Split(containerStatus.ImageID, "@")
-				if len(imageDigestParts) != 2 {
-					continue
-				}
-				artifact.Digest = imageDigestParts[1]
-			case name.Digest:
-				artifact.Digest = t.DigestStr()
-			}
-
-			//
-
 			// Define the report
 			vulnReport = &secscanv1alpha1.VulnerabilityReport{
 				ObjectMeta: metav1.ObjectMeta{
@@ -351,37 +348,109 @@ func (s *Scanner) Reconcile(key string) error {
 					Namespace:   ns,
 				},
 				Spec: secscanv1alpha1.VulnerabilityReportSpec{
-					Registry:        registry,
-					Artifact:        artifact,
-					Vulnerabilities: vulnerabilities,
+					Artifact: *artifact,
+					Registry: *registry,
 				},
 			}
+			scan = true
+		} else {
+			vulnReport = obj.(*secscanv1alpha1.VulnerabilityReport)
 
-			// Add pod to status
-			vulnReport.Status.AddPod(podName, img)
+			// Rescan the image if it's been at least rescanTheshold
+			// amount of time since the last update
+			lastUpdateTime, err := time.Parse("2006-01-02 15:04:05 -0700 MST", vulnReport.Status.LastUpdate)
+			if err != nil {
+				log.Printf("Error parsing VulnerabilityReport's lastUpdate for %s: %s", vulnReportKey, err)
+			}
+			if time.Now().UTC().Sub(lastUpdateTime) > s.rescanThreshold || err != nil {
+				log.Printf("Scheduled rescan for: %s", vulnReportKey)
+				scan = true
+			}
+		}
 
+		if scan {
+			scanImage := strings.Split(containerStatus.ImageID, "://")[1]
+
+			prometheus.PromScansTotal.WithLabelValues(ns).Inc()
+			log.Printf("Scanning: %s", scanImage)
+			vulnerabilities, err := s.scan(scanImage)
+			if err != nil {
+				log.Printf("Error scanning image %s: %s", scanImage, err)
+				return err
+			}
+			log.Printf("Scan finished for: %s", scanImage)
+
+			vulnReport.Spec.Vulnerabilities = vulnerabilities
+			vulnReport.Status.LastUpdate = time.Now().UTC().String()
+		}
+
+		// Add/update the pod on the status
+		changed := vulnReport.AddPod(podName, img)
+
+		// Create/Update the report
+		if !exists {
 			// Create report
 			_, err = vulnReportClient.Create(context.Background(), vulnReport, metav1.CreateOptions{})
 			if err != nil {
-				log.Printf("Error creating vulnerability report for %s: %s", vulnReportKey, err)
-				continue
+				log.Printf("Error creating VulnerabilityReport for %s: %s", vulnReportKey, err)
+				return err
 			}
 			log.Printf("Created VulnerabilityReport: %s", vulnReportKey)
-
-			// Done
-			continue
-		}
-
-		// If a report already exists for this image then add the pod
-		// to the status
-		vulnReport = obj.(*secscanv1alpha1.VulnerabilityReport)
-		if vulnReport.Status.AddPod(podName, img) {
-			_, err = vulnReportClient.Update(context.Background(), vulnReport, metav1.UpdateOptions{})
-			if err != nil {
+		} else if changed {
+			if _, err = vulnReportClient.Update(context.Background(), vulnReport, metav1.UpdateOptions{}); err != nil {
 				log.Printf("Error updating VulnerabilityReport for %s: %s", vulnReportKey, err)
+				return err
 			}
+			log.Printf("Updated VulnerabilityReport: %s", vulnReportKey)
 		}
 	}
 
 	return nil
+}
+
+func (s *Scanner) scan(img string) ([]secscanv1alpha1.VulnerabilityItem, error) {
+	defer prometheus.ObserveScanDuration()()
+	return s.scanAdapter.Scan(img)
+}
+
+func (s *Scanner) updateMetrics() {
+	prometheus.PromVulnerabilityReports.Reset()
+	prometheus.PromVulnerabilities.Reset()
+	prometheus.PromVulnerableImages.Reset()
+
+	var uniqueVulnerabilities []string
+	var uniqueImages []string
+	for _, vulnReport := range s.vulnInformer.GetIndexer().List() {
+		if vr, ok := vulnReport.(*secscanv1alpha1.VulnerabilityReport); ok {
+			// Count up vulnerability reports by namespace and
+			// severity
+			prometheus.PromVulnerabilityReports.WithLabelValues(vr.Namespace, vr.Spec.Summary.HighestSeverity).Inc()
+
+			// Find unique vulnerabilities
+			for _, vuln := range vr.Spec.Vulnerabilities {
+				if !contains(uniqueVulnerabilities, vuln.VulnerabilityID) {
+					uniqueVulnerabilities = append(uniqueVulnerabilities, vuln.VulnerabilityID)
+					prometheus.PromVulnerabilities.WithLabelValues(vuln.Severity).Inc()
+				}
+			}
+
+			// Find unique images
+			if !contains(uniqueImages, vr.Spec.Artifact.Digest) && vr.Spec.Summary.HighestSeverity != "" {
+				uniqueImages = append(uniqueImages, vr.Spec.Artifact.Digest)
+				prometheus.PromVulnerableImages.WithLabelValues(vr.Spec.Summary.HighestSeverity).Inc()
+			}
+
+		}
+	}
+
+	return
+}
+
+func contains(s []string, i string) bool {
+	for _, val := range s {
+		if i == val {
+			return true
+		}
+	}
+	return false
 }
