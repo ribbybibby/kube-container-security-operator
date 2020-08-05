@@ -2,6 +2,7 @@ package trivy
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/aquasecurity/trivy/pkg/report"
 	secscanv1alpha1 "github.com/ribbybibby/kube-container-security-operator/apis/secscan/v1alpha1"
 	"net/url"
@@ -16,24 +17,27 @@ type Client struct {
 
 // Scan scans a target image with trivy and returns the vulnerabilities it finds
 func (c *Client) Scan(target string) ([]secscanv1alpha1.VulnerabilityItem, error) {
-
 	var (
 		vulnerabilities []secscanv1alpha1.VulnerabilityItem
 		args            []string
 	)
+
+	args = []string{"-q"}
 	if c.Client {
 		args = append(args, "client")
 
 		if c.Remote != nil {
 			args = append(args, []string{"--remote", c.Remote.String()}...)
 		}
+	} else {
+		args = append(args, "image")
 	}
-	args = append(args, []string{"-q", "-f", "json", target}...)
+	args = append(args, []string{"-f", "json", target}...)
 
 	cmd := exec.Command("trivy", args...)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return vulnerabilities, err
+		return vulnerabilities, fmt.Errorf("Error scanning %s: %s %s", target, string(out), err)
 	}
 
 	var results report.Results

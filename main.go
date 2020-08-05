@@ -22,14 +22,15 @@ var (
 func main() {
 	flag.Parse()
 
-	s, err := scanner.New(
-		*namespace,
-		&trivy.Client{
+	s, err := scanner.New(&scanner.Config{
+		Namespace: *namespace,
+		Adapter: &trivy.Client{
 			Client: *trivyClient,
 		},
-		*rescanThreshold,
-		*resyncPeriod,
-	)
+		RescanThreshold: *rescanThreshold,
+		ResyncPeriod:    *resyncPeriod,
+	})
+
 	if err != nil {
 		log.Fatalln(err)
 	}

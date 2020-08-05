@@ -29,6 +29,14 @@ var (
 	errPodNotRunningOrReady = fmt.Errorf("Pod not running or ready")
 )
 
+// Config for a scanner
+type Config struct {
+	Namespace       string
+	Adapter         adapter.Interface
+	RescanThreshold time.Duration
+	ResyncPeriod    time.Duration
+}
+
 // Scanner performs vulnerability scans on pods in a Kubernetes cluster and
 // saves the results as a VulnerabilityReport resource
 type Scanner struct {
@@ -37,30 +45,28 @@ type Scanner struct {
 	vulnInformer    cache.SharedIndexInformer
 	vulnClient      versioned.Interface
 	queue           workqueue.RateLimitingInterface
-	ns              string
 	scanAdapter     adapter.Interface
 	rescanThreshold time.Duration
-	resyncPeriod    time.Duration
 }
 
 // New returns a new Scanner
-func New(ns string, scanAdapter adapter.Interface, rescanThreshold, resyncPeriod time.Duration) (*Scanner, error) {
+func New(config *Config) (*Scanner, error) {
 	// Kubernetes config
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},
 	)
-	config, err := kubeConfig.ClientConfig()
+	kubeClientConfig, err := kubeConfig.ClientConfig()
 	if err != nil {
 		return nil, err
 	}
 
 	// Kubernetes clients
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(kubeClientConfig)
 	if err != nil {
 		return nil, err
 	}
-	vulnClientSet, err := versioned.NewForConfig(config)
+	vulnClientSet, err := versioned.NewForConfig(kubeClientConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -69,26 +75,24 @@ func New(ns string, scanAdapter adapter.Interface, rescanThreshold, resyncPeriod
 	scanner := &Scanner{
 		kubeClient:      clientset,
 		vulnClient:      vulnClientSet,
-		ns:              ns,
-		scanAdapter:     scanAdapter,
-		rescanThreshold: rescanThreshold,
-		resyncPeriod:    resyncPeriod,
+		scanAdapter:     config.Adapter,
+		rescanThreshold: config.RescanThreshold,
 	}
 	scanner.queue = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "scanner")
 
 	// Pod informer
 	podListWatcher := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return scanner.kubeClient.CoreV1().Pods(ns).List(context.Background(), options)
+			return scanner.kubeClient.CoreV1().Pods(config.Namespace).List(context.Background(), options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return scanner.kubeClient.CoreV1().Pods(ns).Watch(context.Background(), options)
+			return scanner.kubeClient.CoreV1().Pods(config.Namespace).Watch(context.Background(), options)
 		},
 	}
 	scanner.podInformer = cache.NewSharedIndexInformer(
 		podListWatcher,
 		&corev1.Pod{},
-		resyncPeriod,
+		config.ResyncPeriod,
 		cache.Indexers{},
 	)
 	scanner.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -100,16 +104,16 @@ func New(ns string, scanAdapter adapter.Interface, rescanThreshold, resyncPeriod
 	// VulnerabilityReport informer
 	vulnListWatcher := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return scanner.vulnClient.SecscanV1alpha1().VulnerabilityReports(ns).List(context.Background(), options)
+			return scanner.vulnClient.SecscanV1alpha1().VulnerabilityReports(config.Namespace).List(context.Background(), options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return scanner.vulnClient.SecscanV1alpha1().VulnerabilityReports(ns).Watch(context.Background(), options)
+			return scanner.vulnClient.SecscanV1alpha1().VulnerabilityReports(config.Namespace).Watch(context.Background(), options)
 		},
 	}
 	scanner.vulnInformer = cache.NewSharedIndexInformer(
 		vulnListWatcher,
 		&secscanv1alpha1.VulnerabilityReport{},
-		resyncPeriod,
+		config.ResyncPeriod,
 		cache.Indexers{},
 	)
 	scanner.vulnInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -183,6 +187,39 @@ func (s *Scanner) handleDeleteVulnerabilityReport(obj interface{}) {
 
 func (s *Scanner) handleUpdateVulnerabilityReport(oldObj, newObj interface{}) {
 	s.updateMetrics()
+}
+
+func (s *Scanner) updateMetrics() {
+	prometheus.PromVulnerabilityReports.Reset()
+	prometheus.PromVulnerabilities.Reset()
+	prometheus.PromVulnerableImages.Reset()
+
+	var uniqueVulnerabilities []string
+	var uniqueImages []string
+	for _, vulnReport := range s.vulnInformer.GetIndexer().List() {
+		if vr, ok := vulnReport.(*secscanv1alpha1.VulnerabilityReport); ok {
+			// Count up vulnerability reports by namespace and
+			// severity
+			prometheus.PromVulnerabilityReports.WithLabelValues(vr.Namespace, vr.Spec.Summary.HighestSeverity).Inc()
+
+			// Find unique vulnerabilities
+			for _, vuln := range vr.Spec.Vulnerabilities {
+				if !contains(uniqueVulnerabilities, vuln.VulnerabilityID) {
+					uniqueVulnerabilities = append(uniqueVulnerabilities, vuln.VulnerabilityID)
+					prometheus.PromVulnerabilities.WithLabelValues(vuln.Severity).Inc()
+				}
+			}
+
+			// Find unique images
+			if !contains(uniqueImages, vr.Spec.Artifact.Digest) && vr.Spec.Summary.HighestSeverity != "" {
+				uniqueImages = append(uniqueImages, vr.Spec.Artifact.Digest)
+				prometheus.PromVulnerableImages.WithLabelValues(vr.Spec.Summary.HighestSeverity).Inc()
+			}
+
+		}
+	}
+
+	return
 }
 
 func (s *Scanner) handleAddPod(obj interface{}) {
@@ -310,10 +347,6 @@ func (s *Scanner) Reconcile(key string) error {
 
 	// Scan pod containers
 	for _, containerStatus := range pod.Status.ContainerStatuses {
-		img := containerStatus.Image
-
-		var vulnReport *secscanv1alpha1.VulnerabilityReport
-
 		// Parse the image into a registry and artifact
 		registry, artifact, err := parseImage(containerStatus)
 		if err != nil {
@@ -333,13 +366,14 @@ func (s *Scanner) Reconcile(key string) error {
 			continue
 		}
 
+		var vulnReport *secscanv1alpha1.VulnerabilityReport
+
 		// Controls whether the image is scanned or not
 		scan := false
 
 		// If a vulnerability report doesn't already exist for this
-		// image then create it
+		// image then define it
 		if !exists {
-			// Define the report
 			vulnReport = &secscanv1alpha1.VulnerabilityReport{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      make(map[string]string),
@@ -384,10 +418,11 @@ func (s *Scanner) Reconcile(key string) error {
 			vulnReport.Status.LastUpdate = time.Now().UTC().String()
 		}
 
-		// Add/update the pod on the status
-		changed := vulnReport.AddPod(podName, img)
+		// Add/update the pods on the status
+		podsChanged := vulnReport.AddPod(podName, containerStatus.Image)
 
-		// Create/Update the report
+		// Create the report if it didn't already exist. Or, update it if
+		// the pod status changed or the image was rescanned
 		if !exists {
 			// Create report
 			_, err = vulnReportClient.Create(context.Background(), vulnReport, metav1.CreateOptions{})
@@ -396,7 +431,7 @@ func (s *Scanner) Reconcile(key string) error {
 				return err
 			}
 			log.Printf("Created VulnerabilityReport: %s", vulnReportKey)
-		} else if changed {
+		} else if podsChanged || scan {
 			if _, err = vulnReportClient.Update(context.Background(), vulnReport, metav1.UpdateOptions{}); err != nil {
 				log.Printf("Error updating VulnerabilityReport for %s: %s", vulnReportKey, err)
 				return err
@@ -411,39 +446,6 @@ func (s *Scanner) Reconcile(key string) error {
 func (s *Scanner) scan(img string) ([]secscanv1alpha1.VulnerabilityItem, error) {
 	defer prometheus.ObserveScanDuration()()
 	return s.scanAdapter.Scan(img)
-}
-
-func (s *Scanner) updateMetrics() {
-	prometheus.PromVulnerabilityReports.Reset()
-	prometheus.PromVulnerabilities.Reset()
-	prometheus.PromVulnerableImages.Reset()
-
-	var uniqueVulnerabilities []string
-	var uniqueImages []string
-	for _, vulnReport := range s.vulnInformer.GetIndexer().List() {
-		if vr, ok := vulnReport.(*secscanv1alpha1.VulnerabilityReport); ok {
-			// Count up vulnerability reports by namespace and
-			// severity
-			prometheus.PromVulnerabilityReports.WithLabelValues(vr.Namespace, vr.Spec.Summary.HighestSeverity).Inc()
-
-			// Find unique vulnerabilities
-			for _, vuln := range vr.Spec.Vulnerabilities {
-				if !contains(uniqueVulnerabilities, vuln.VulnerabilityID) {
-					uniqueVulnerabilities = append(uniqueVulnerabilities, vuln.VulnerabilityID)
-					prometheus.PromVulnerabilities.WithLabelValues(vuln.Severity).Inc()
-				}
-			}
-
-			// Find unique images
-			if !contains(uniqueImages, vr.Spec.Artifact.Digest) && vr.Spec.Summary.HighestSeverity != "" {
-				uniqueImages = append(uniqueImages, vr.Spec.Artifact.Digest)
-				prometheus.PromVulnerableImages.WithLabelValues(vr.Spec.Summary.HighestSeverity).Inc()
-			}
-
-		}
-	}
-
-	return
 }
 
 func contains(s []string, i string) bool {

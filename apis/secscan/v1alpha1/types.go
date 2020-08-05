@@ -113,7 +113,11 @@ func (vr *VulnerabilityReport) MarshalJSON() ([]byte, error) {
 	metadata.Labels["severity"] = vrs.Summary.HighestSeverity
 
 	for pod := range vr.Status.Pods {
-		metadata.Labels[pod] = "true"
+		// Labels can only be 63 characters long but pod names can be
+		// longer
+		if len(pod) < 64 {
+			metadata.Labels[pod] = "true"
+		}
 	}
 
 	type Alias VulnerabilityReport
