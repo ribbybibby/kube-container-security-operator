@@ -10,7 +10,7 @@ var (
 	PromVulnerabilities = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "scanner_cluster_vulnerabilities",
-			Help: "Total number of unique vulnerabilities in the cluster, labeled by severity",
+			Help: "Total number of unique vulnerabilities in the cluster by severity",
 		},
 		[]string{
 			"severity",
@@ -20,7 +20,7 @@ var (
 	PromVulnerableImages = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "scanner_cluster_vulnerable_images",
-			Help: "Total number of unique vulnerable images running",
+			Help: "Total number of unique vulnerable images running by severity",
 		},
 		[]string{
 			"severity",
@@ -29,7 +29,7 @@ var (
 
 	PromVulnerabilityReports = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "scanner_vulnerability_reports",
+			Name: "scanner_vulnerabilityreports",
 			Help: "Total number of vulnerability reports by namespace and highest severity",
 		},
 		[]string{
