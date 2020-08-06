@@ -1,53 +1,81 @@
-GOPKG = github.com/ribbybibby/kube-container-security-operator
 
-.PHONY: vendor
-vendor:
-	go mod vendor
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+# Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
+CRD_OPTIONS ?= "crd:trivialVersions=true"
 
-.PHONY: deepcopy
-deepcopy:
-	deepcopy-gen \
-	-i github.com/ribbybibby/kube-container-security-operator/apis/secscan/v1alpha1 \
-	-v=4 \
-	--logtostderr \
-	--output-file-base zz_generated.deepcopy
-	go fmt apis/secscan/v1alpha1/zz_generated.deepcopy.go
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN=$(shell go env GOPATH)/bin
+else
+GOBIN=$(shell go env GOBIN)
+endif
 
-.PHONY: openapi
-openapi:
-	openapi-gen \
-	-i github.com/ribbybibby/kube-container-security-operator/apis/secscan/v1alpha1,k8s.io/apimachinery/pkg/apis/meta/v1,k8s.io/api/core/v1 \
-	-v=4 \
-	-p github.com/ribbybibby/kube-container-security-operator/apis/secscan/v1alpha1
-	go fmt apis/secscan/v1alpha1/openapi_generated.go
+all: manager
 
-.PHONY: clientset
-clientset:
-	client-gen \
-	-v=4 \
-	--input-base     "" \
-	--clientset-name "versioned" \
-	--input	         "$(GOPKG)/apis/secscan/v1alpha1" \
-	--output-package "$(GOPKG)/generated"
+# Run tests
+test: generate fmt vet manifests
+	go test ./... -coverprofile cover.out
 
-.PHONY: listers
-listers:
-	lister-gen \
-	-v=4 \
-	--input-dirs     "$(GOPKG)/apis/secscan/v1alpha1" \
-	--output-package "$(GOPKG)/generated/listers"
+# Build manager binary
+manager: generate fmt vet
+	go build -o bin/manager main.go
 
-.PHONY: informers
-informers:
-	informer-gen \
-	-v=4 \
-	--versioned-clientset-package "$(GOPKG)/generated/versioned" \
-	--listers-package "$(GOPKG)/generated/listers" \
-	--input-dirs      "$(GOPKG)/apis/secscan/v1alpha1" \
-	--output-package  "$(GOPKG)/generated/informers"
-.PHONY: crd
-crd:
-	controller-gen crd:trivialVersions=true paths="./..." output:crd:artifacts:config=deploy
+# Run against the configured Kubernetes cluster in ~/.kube/config
+run: generate fmt vet manifests
+	go run ./main.go
 
-.PHONY: codegen
-codegen: deepcopy clientset crd
+# Install CRDs into a cluster
+install: manifests
+	kustomize build config/crd | kubectl apply -f -
+
+# Uninstall CRDs from a cluster
+uninstall: manifests
+	kustomize build config/crd | kubectl delete -f -
+
+# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
+deploy: manifests
+	cd config/manager && kustomize edit set image controller=${IMG}
+	kustomize build config/default | kubectl apply -f -
+
+# Generate manifests e.g. CRD, RBAC etc.
+.PHONY: manifests
+manifests: controller-gen
+	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=manifests/base/crds
+
+# Run go fmt against code
+fmt:
+	go fmt ./...
+
+# Run go vet against code
+vet:
+	go vet ./...
+
+# Generate code
+generate: controller-gen
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+
+# Build the docker image
+docker-build: test
+	docker build . -t ${IMG}
+
+# Push the docker image
+docker-push:
+	docker push ${IMG}
+
+# find or download controller-gen
+# download controller-gen if necessary
+controller-gen:
+ifeq (, $(shell which controller-gen))
+	@{ \
+	set -e ;\
+	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
+	cd $$CONTROLLER_GEN_TMP_DIR ;\
+	go mod init tmp ;\
+	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.5 ;\
+	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
+	}
+CONTROLLER_GEN=$(GOBIN)/controller-gen
+else
+CONTROLLER_GEN=$(shell which controller-gen)
+endif

@@ -4,10 +4,11 @@ go 1.14
 
 require (
 	github.com/aquasecurity/trivy v0.10.1
+	github.com/go-logr/logr v0.1.0
 	github.com/google/go-containerregistry v0.0.0-20200331213917-3d03ed9b1ca2
 	github.com/prometheus/client_golang v1.0.0
 	k8s.io/api v0.18.6
 	k8s.io/apimachinery v0.18.6
 	k8s.io/client-go v0.18.6
-	k8s.io/kube-openapi v0.0.0-20200727223308-4c7aaf529f79 // indirect
+	sigs.k8s.io/controller-runtime v0.6.2
 )

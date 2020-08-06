@@ -2,7 +2,7 @@ package prometheus
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	"log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"time"
 )
 
@@ -27,28 +27,6 @@ var (
 		},
 	)
 
-	PromPodEventsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "scanner_pod_events_total",
-			Help: "Total number of pod events, per namespace",
-		},
-		[]string{
-			"event",
-			"namespace",
-		},
-	)
-
-	PromVulnerabilityReportEventsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "scanner_vulnerability_report_events_total",
-			Help: "Total number of VulnerabilityReport events, per namespace",
-		},
-		[]string{
-			"event",
-			"namespace",
-		},
-	)
-
 	PromVulnerabilityReports = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "scanner_vulnerability_reports",
@@ -60,27 +38,13 @@ var (
 		},
 	)
 
-	PromScansTotal = prometheus.NewCounterVec(
+	PromScans = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "scanner_scans_total",
+			Name: "scanner_scans",
 			Help: "Total number of scans performed, by namespace",
 		},
 		[]string{
 			"namespace",
-		},
-	)
-
-	PromQueueSize = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "scanner_queue_size",
-			Help: "Number of items in the scanner's queue to process",
-		},
-	)
-
-	PromReconciliationDurationSeconds = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name: "scanner_reconciliation_duration_seconds",
-			Help: "Time it takes for the operator's reconciliation, in seconds",
 		},
 	)
 
@@ -92,13 +56,6 @@ var (
 	)
 )
 
-func ObserveReconciliationDuration() func() {
-	start := time.Now()
-	return func() {
-		PromReconciliationDurationSeconds.Observe(time.Since(start).Seconds())
-	}
-}
-
 func ObserveScanDuration() func() {
 	start := time.Now()
 	return func() {
@@ -107,15 +64,11 @@ func ObserveScanDuration() func() {
 }
 
 func init() {
-	prometheus.MustRegister(PromVulnerabilities)
-	prometheus.MustRegister(PromVulnerableImages)
-	prometheus.MustRegister(PromPodEventsTotal)
-	prometheus.MustRegister(PromVulnerabilityReportEventsTotal)
-	prometheus.MustRegister(PromVulnerabilityReports)
-	prometheus.MustRegister(PromQueueSize)
-	prometheus.MustRegister(PromScansTotal)
-	prometheus.MustRegister(PromScanDurationSeconds)
-	prometheus.MustRegister(PromReconciliationDurationSeconds)
-
-	log.Println("Registered prometheus metrics")
+	metrics.Registry.MustRegister(
+		PromVulnerabilities,
+		PromVulnerableImages,
+		PromVulnerabilityReports,
+		PromScans,
+		PromScanDurationSeconds,
+	)
 }
